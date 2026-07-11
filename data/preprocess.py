@@ -78,24 +78,56 @@ def letterbox(img: np.ndarray, size: int = 1024, color=(114, 114, 114)):
 
 def adjust_yolo_labels_text(label_text: str, orig_w: int, orig_h: int, scale: float,
                              pad_left: float, pad_top: float, size: int) -> str:
+    """Handles two label line formats found in the wild:
+      - box:     class cx cy w h                (5 tokens)
+      - polygon: class x1 y1 x2 y2 ... xn yn     (odd token count > 5, YOLO-seg style)
+
+    This dataset's "YOLO" folder ships polygon segmentation labels, not plain
+    boxes - discovered when every remapped label file came out empty because
+    the original code assumed a fixed 5-value box format and silently errored
+    on every polygon line. Since Stage 1 is a plain object detector (Stage 2's
+    U-Net already handles precise lesion shape via the separate COCO masks),
+    polygons are converted here to their tight bounding box.
+    """
     lines_out = []
     for line in label_text.splitlines():
         if not line.strip():
             continue
-        cls, cx, cy, w, h = line.split()
-        cls, cx, cy, w, h = int(cls), float(cx), float(cy), float(w), float(h)
+        tokens = line.split()
+        cls = int(tokens[0])
+        coords = [float(t) for t in tokens[1:]]
 
-        cx_px, cy_px = cx * orig_w, cy * orig_h
-        w_px, h_px = w * orig_w, h * orig_h
+        if len(coords) == 4:
+            # already a box: cx, cy, w, h
+            cx, cy, w, h = coords
+            x1, y1 = cx - w / 2, cy - h / 2
+            x2, y2 = cx + w / 2, cy + h / 2
+        elif len(coords) >= 6 and len(coords) % 2 == 0:
+            # polygon: pairs of (x, y) -> tight bounding box
+            xs = coords[0::2]
+            ys = coords[1::2]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        else:
+            print(f"[preprocess] WARNING: unrecognized label line format, skipping: '{line[:60]}...'")
+            continue
 
-        cx_px = cx_px * scale + pad_left
-        cy_px = cy_px * scale + pad_top
-        w_px *= scale
-        h_px *= scale
+        # de-normalize corners against original image size
+        x1_px, y1_px = x1 * orig_w, y1 * orig_h
+        x2_px, y2_px = x2 * orig_w, y2 * orig_h
 
-        lines_out.append(
-            f"{cls} {cx_px / size:.6f} {cy_px / size:.6f} {w_px / size:.6f} {h_px / size:.6f}"
-        )
+        # apply the same scale + pad as the image (letterbox)
+        x1_px = x1_px * scale + pad_left
+        y1_px = y1_px * scale + pad_top
+        x2_px = x2_px * scale + pad_left
+        y2_px = y2_px * scale + pad_top
+
+        # re-normalize against the letterboxed canvas, back to YOLO box format
+        cx_new = ((x1_px + x2_px) / 2) / size
+        cy_new = ((y1_px + y2_px) / 2) / size
+        w_new = (x2_px - x1_px) / size
+        h_new = (y2_px - y1_px) / size
+
+        lines_out.append(f"{cls} {cx_new:.6f} {cy_new:.6f} {w_new:.6f} {h_new:.6f}")
     return "\n".join(lines_out) + ("\n" if lines_out else "")
 
 
