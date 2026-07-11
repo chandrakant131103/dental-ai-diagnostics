@@ -9,17 +9,30 @@ This module applies:
   2. Denoising (fast non-local means) - panoramic X-rays are grainy.
   3. Resize + pad to a consistent square size (letterbox) so YOLO/U-Net see
      undistorted teeth geometry.
+  4. (If --labels-src given) remaps YOLO-format bounding box labels to match
+     the letterboxed image, in the same worker pass as the image itself.
+
+Parallelized across CPU cores with multiprocessing, and resumable: if you
+rerun after a Colab disconnect, already-processed images are skipped rather
+than redone, so you don't lose progress.
 
 Usage:
     python data/preprocess.py --src /content/data/train/images \
-                               --dst /content/data_processed/train/images
+                               --dst /content/data_proc/train/images \
+                               --labels-src /content/data/train/labels \
+                               --labels-dst /content/data_proc/train/labels \
+                               --size 1024
 """
 import argparse
+import multiprocessing as mp
+import os
+import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-from tqdm import tqdm
+
+IMG_EXTS = (".jpg", ".jpeg", ".png")
 
 
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.5, tile_grid_size=(8, 8)) -> np.ndarray:
@@ -36,12 +49,15 @@ def apply_clahe(img: np.ndarray, clip_limit: float = 2.5, tile_grid_size=(8, 8))
 
 
 def denoise(img: np.ndarray) -> np.ndarray:
+    # h=6 (filter strength) kept low deliberately - this is the slowest step,
+    # and panoramic X-rays don't need aggressive denoising that would also
+    # blur out fine lesion boundaries.
     if img.ndim == 3:
         return cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
     return cv2.fastNlMeansDenoising(img, None, 6, 7, 21)
 
 
-def letterbox(img: np.ndarray, size: int = 1024, color=(114, 114, 114)) -> np.ndarray:
+def letterbox(img: np.ndarray, size: int = 1024, color=(114, 114, 114)):
     h, w = img.shape[:2]
     scale = size / max(h, w)
     nh, nw = int(round(h * scale)), int(round(w * scale))
@@ -52,48 +68,14 @@ def letterbox(img: np.ndarray, size: int = 1024, color=(114, 114, 114)) -> np.nd
     )
     top = (size - nh) // 2
     left = (size - nw) // 2
-    canvas[top : top + nh, left : left + nw] = resized
-    return canvas
+    canvas[top: top + nh, left: left + nw] = resized
+    return canvas, scale, left, top
 
 
-def process_image(path: Path, out_path: Path, size: int = 1024):
-    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None:
-        print(f"[preprocess] Could not read {path}, skipping.")
-        return
-    img = denoise(img)
-    img = apply_clahe(img)
-    img = letterbox(img, size=size)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), img)
-
-
-def process_dir(src_dir: str, dst_dir: str, size: int = 1024, exts=(".jpg", ".jpeg", ".png")):
-    src = Path(src_dir)
-    dst = Path(dst_dir)
-    files = [p for p in src.iterdir() if p.suffix.lower() in exts]
-    print(f"[preprocess] Found {len(files)} images in {src}")
-    for p in tqdm(files):
-        process_image(p, dst / p.name, size=size)
-    print(f"[preprocess] Done -> {dst}")
-
-
-def adjust_yolo_labels(label_path: Path, out_path: Path, orig_w: int, orig_h: int, size: int = 1024):
-    """Letterboxing changes where objects sit in the frame, so YOLO-format
-    labels (normalized cx,cy,w,h) must be remapped to match. Run this in
-    lockstep with process_image on the corresponding label file."""
-    scale = size / max(orig_w, orig_h)
-    nw, nh = orig_w * scale, orig_h * scale
-    pad_left = (size - nw) / 2
-    pad_top = (size - nh) / 2
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not label_path.exists():
-        out_path.write_text("")
-        return
-
+def adjust_yolo_labels_text(label_text: str, orig_w: int, orig_h: int, scale: float,
+                             pad_left: float, pad_top: float, size: int) -> str:
     lines_out = []
-    for line in label_path.read_text().splitlines():
+    for line in label_text.splitlines():
         if not line.strip():
             continue
         cls, cx, cy, w, h = line.split()
@@ -110,7 +92,82 @@ def adjust_yolo_labels(label_path: Path, out_path: Path, orig_w: int, orig_h: in
         lines_out.append(
             f"{cls} {cx_px / size:.6f} {cy_px / size:.6f} {w_px / size:.6f} {h_px / size:.6f}"
         )
-    out_path.write_text("\n".join(lines_out) + "\n")
+    return "\n".join(lines_out) + ("\n" if lines_out else "")
+
+
+def _worker(args):
+    img_path, dst_img_path, label_path, out_label_path, size = args
+    try:
+        # resume support: skip if already done
+        if dst_img_path.exists() and (out_label_path is None or out_label_path.exists()):
+            return ("skipped", str(img_path))
+
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img is None:
+            return ("error", f"could not read {img_path}")
+        orig_h, orig_w = img.shape[:2]
+
+        img = denoise(img)
+        img = apply_clahe(img)
+        img, scale, pad_left, pad_top = letterbox(img, size=size)
+
+        dst_img_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(dst_img_path), img)
+
+        if out_label_path is not None:
+            out_label_path.parent.mkdir(parents=True, exist_ok=True)
+            label_text = label_path.read_text() if (label_path and label_path.exists()) else ""
+            remapped = adjust_yolo_labels_text(label_text, orig_w, orig_h, scale, pad_left, pad_top, size)
+            out_label_path.write_text(remapped)
+
+        return ("ok", str(img_path))
+    except Exception as e:
+        return ("error", f"{img_path}: {e}")
+
+
+def process_dir(src_dir, dst_dir, labels_src=None, labels_dst=None, size=1024,
+                 workers=None, progress_every=200):
+    src = Path(src_dir)
+    dst = Path(dst_dir)
+    files = sorted([p for p in src.iterdir() if p.suffix.lower() in IMG_EXTS])
+    total = len(files)
+    print(f"[preprocess] {total} images in {src} -> {dst} (size={size})")
+
+    tasks = []
+    for p in files:
+        dst_img_path = dst / p.name
+        label_path = Path(labels_src) / (p.stem + ".txt") if labels_src else None
+        out_label_path = Path(labels_dst) / (p.stem + ".txt") if labels_dst else None
+        tasks.append((p, dst_img_path, label_path, out_label_path, size))
+
+    workers = workers or max(1, os.cpu_count() - 1)
+    print(f"[preprocess] Using {workers} worker processes")
+
+    done, skipped, errors = 0, 0, 0
+    start = time.time()
+
+    with mp.Pool(processes=workers) as pool:
+        for status, info in pool.imap_unordered(_worker, tasks, chunksize=8):
+            done += 1
+            if status == "skipped":
+                skipped += 1
+            elif status == "error":
+                errors += 1
+                print(f"[preprocess] ERROR: {info}")
+
+            if done % progress_every == 0 or done == total:
+                elapsed = time.time() - start
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = (total - done) / rate if rate > 0 else 0
+                print(
+                    f"[preprocess] processed {done}/{total} "
+                    f"(skipped={skipped}, errors={errors}) "
+                    f"- {rate:.1f} img/s - ~{remaining/60:.1f} min remaining",
+                    flush=True,
+                )
+
+    print(f"[preprocess] Done -> {dst} ({done} processed, {skipped} skipped, {errors} errors, "
+          f"{(time.time()-start)/60:.1f} min total)")
 
 
 if __name__ == "__main__":
@@ -118,20 +175,17 @@ if __name__ == "__main__":
     parser.add_argument("--src", required=True, help="images dir")
     parser.add_argument("--dst", required=True, help="output images dir")
     parser.add_argument("--labels-src", default=None, help="optional YOLO labels dir to remap")
-    parser.add_argument("--labels-dst", default=None, help="output labels dir")
+    parser.add_argument("--labels-dst", default=None, help="output labels dir (required if --labels-src set)")
     parser.add_argument("--size", type=int, default=1024)
+    parser.add_argument("--workers", type=int, default=None, help="default: cpu_count - 1")
+    parser.add_argument("--progress-every", type=int, default=200)
     args = parser.parse_args()
 
-    process_dir(args.src, args.dst, size=args.size)
+    if args.labels_src and not args.labels_dst:
+        parser.error("--labels-dst is required when --labels-src is given")
 
-    if args.labels_src:
-        src_img_dir = Path(args.src)
-        for img_path in src_img_dir.glob("*.*"):
-            img = cv2.imread(str(img_path))
-            if img is None:
-                continue
-            h, w = img.shape[:2]
-            label_path = Path(args.labels_src) / (img_path.stem + ".txt")
-            out_label_path = Path(args.labels_dst) / (img_path.stem + ".txt")
-            adjust_yolo_labels(label_path, out_label_path, w, h, size=args.size)
-        print(f"[preprocess] Remapped labels -> {args.labels_dst}")
+    process_dir(
+        args.src, args.dst,
+        labels_src=args.labels_src, labels_dst=args.labels_dst,
+        size=args.size, workers=args.workers, progress_every=args.progress_every,
+    )
