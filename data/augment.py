@@ -88,7 +88,10 @@ def read_yolo_labels(label_path: Path, min_size: float = 1e-4):
 
 def write_yolo_labels(path: Path, boxes, classes):
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{c} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}" for c, b in zip(classes, boxes)]
+    # Albumentations can hand back class labels as numpy float (e.g. 1.0)
+    # once bbox coords are floats internally - force back to int so the
+    # output stays valid YOLO format ("1 ..." not "1.0 ...").
+    lines = [f"{int(round(c))} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}" for c, b in zip(classes, boxes)]
     path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
