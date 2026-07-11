@@ -29,7 +29,9 @@ def compute_class_distribution(labels_dir: str) -> dict:
     for f in Path(labels_dir).glob("*.txt"):
         for line in f.read_text().splitlines():
             if line.strip():
-                counts[int(line.split()[0])] += 1
+                # tolerate "1" or "1.0" - defensive against any label writer
+                # upstream that hands back a float-formatted class id
+                counts[int(round(float(line.split()[0])))] += 1
     return dict(sorted(counts.items()))
 
 
@@ -46,16 +48,28 @@ def main(args):
     train_labels_dir = (data_yaml.parent / data_cfg["train"].replace("images", "labels")).resolve()
 
     if train_labels_dir.exists():
+        label_files = list(train_labels_dir.glob("*.txt"))
         dist = compute_class_distribution(str(train_labels_dir))
-        names = data_cfg.get("names", {})
-        print("[train] Class distribution (train split):")
-        for cls_id, count in dist.items():
-            cls_name = names[cls_id] if isinstance(names, list) else names.get(cls_id, cls_id)
-            print(f"  {cls_id:>2} {cls_name:<20} {count}")
-        imbalance_ratio = max(dist.values()) / max(min(dist.values()), 1)
-        print(f"[train] Max/min class imbalance ratio: {imbalance_ratio:.1f}x")
-        if imbalance_ratio > 10:
-            print("[train] Severe imbalance detected -> recommend focal loss / oversampling rare classes")
+        if not dist:
+            print(
+                f"[train] WARNING: found {len(label_files)} label file(s) in {train_labels_dir}, "
+                f"but zero non-empty annotation lines across all of them. "
+                f"Training will likely produce a useless model with no positive boxes to learn from. "
+                f"Check that preprocessing/augmentation actually populated this labels folder correctly "
+                f"before continuing (see: !find {train_labels_dir} -name '*.txt' | xargs wc -l | tail -1)."
+            )
+        else:
+            names = data_cfg.get("names", {})
+            print("[train] Class distribution (train split):")
+            for cls_id, count in dist.items():
+                cls_name = names[cls_id] if isinstance(names, list) else names.get(cls_id, cls_id)
+                print(f"  {cls_id:>2} {cls_name:<20} {count}")
+            imbalance_ratio = max(dist.values()) / max(min(dist.values()), 1)
+            print(f"[train] Max/min class imbalance ratio: {imbalance_ratio:.1f}x")
+            if imbalance_ratio > 10:
+                print("[train] Severe imbalance detected -> recommend focal loss / oversampling rare classes")
+    else:
+        print(f"[train] WARNING: expected labels dir {train_labels_dir} does not exist - skipping distribution check.")
 
     model = YOLO(args.model)
     results = model.train(
