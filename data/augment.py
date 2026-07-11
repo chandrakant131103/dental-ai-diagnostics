@@ -25,14 +25,33 @@ from tqdm import tqdm
 def build_transform(safe_mode: bool = True):
     """safe_mode=True avoids left/right flips (clinically meaningful in
     dental imaging). Set False only if you also remap FDI tooth-number
-    classes on flip."""
+    classes on flip.
+
+    GaussNoise/CoarseDropout kwargs vary across Albumentations versions
+    (var_limit -> std_range, max_holes/max_height/max_width ->
+    num_holes_range/hole_height_range/hole_width_range in >=1.4.15). Try the
+    modern API first and fall back to the legacy one so this works either way
+    without silently dropping the augmentation to defaults.
+    """
+    try:
+        gauss_noise = A.GaussNoise(std_range=(0.03, 0.1), p=0.3)
+    except TypeError:
+        gauss_noise = A.GaussNoise(var_limit=(5.0, 20.0), p=0.3)
+
+    try:
+        coarse_dropout = A.CoarseDropout(
+            num_holes_range=(1, 3), hole_height_range=(8, 24), hole_width_range=(8, 24), p=0.15
+        )
+    except TypeError:
+        coarse_dropout = A.CoarseDropout(max_holes=3, max_height=24, max_width=24, p=0.15)
+
     transforms = [
         A.Rotate(limit=8, border_mode=cv2.BORDER_CONSTANT, p=0.5),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
-        A.GaussNoise(var_limit=(5.0, 20.0), p=0.3),
+        gauss_noise,
         A.Sharpen(alpha=(0.1, 0.3), lightness=(0.8, 1.0), p=0.2),
         A.RandomGamma(gamma_limit=(85, 115), p=0.3),
-        A.CoarseDropout(max_holes=3, max_height=24, max_width=24, p=0.15),
+        coarse_dropout,
     ]
     if not safe_mode:
         transforms.insert(0, A.HorizontalFlip(p=0.5))
@@ -43,16 +62,27 @@ def build_transform(safe_mode: bool = True):
     )
 
 
-def read_yolo_labels(label_path: Path):
+def read_yolo_labels(label_path: Path, min_size: float = 1e-4):
+    """min_size filters out degenerate zero/near-zero width or height boxes -
+    these come from a handful of collapsed polygon->bbox conversions upstream
+    and otherwise cause a divide-by-zero warning (and undefined behavior)
+    inside Albumentations' bbox visibility filtering."""
     boxes, classes = [], []
     if not label_path.exists():
         return boxes, classes
+    skipped = 0
     for line in label_path.read_text().splitlines():
         if not line.strip():
             continue
         cls, cx, cy, w, h = line.split()
-        boxes.append([float(cx), float(cy), float(w), float(h)])
+        w, h = float(w), float(h)
+        if w < min_size or h < min_size:
+            skipped += 1
+            continue
+        boxes.append([float(cx), float(cy), w, h])
         classes.append(int(cls))
+    if skipped:
+        print(f"[augment] {label_path.name}: skipped {skipped} degenerate (near-zero-area) box(es)")
     return boxes, classes
 
 
