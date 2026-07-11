@@ -48,13 +48,17 @@ def apply_clahe(img: np.ndarray, clip_limit: float = 2.5, tile_grid_size=(8, 8))
         return clahe.apply(img)
 
 
-def denoise(img: np.ndarray) -> np.ndarray:
-    # h=6 (filter strength) kept low deliberately - this is the slowest step,
-    # and panoramic X-rays don't need aggressive denoising that would also
-    # blur out fine lesion boundaries.
-    if img.ndim == 3:
-        return cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
-    return cv2.fastNlMeansDenoising(img, None, 6, 7, 21)
+def denoise(img: np.ndarray, method: str = "bilateral") -> np.ndarray:
+    """bilateral (default) is ~5-10x faster than NLM and still edge-preserving
+    - the right tradeoff for Colab free-tier CPU limits. Use method='nlm' for
+    marginally higher quality if you have more CPU headroom / more patience."""
+    if method == "nlm":
+        if img.ndim == 3:
+            return cv2.fastNlMeansDenoisingColored(img, None, 6, 6, 7, 21)
+        return cv2.fastNlMeansDenoising(img, None, 6, 7, 21)
+    # bilateral: d=5 (small neighborhood) keeps it fast; sigmaColor/sigmaSpace
+    # tuned for grayscale-ish X-ray noise without over-smoothing lesion edges
+    return cv2.bilateralFilter(img, d=5, sigmaColor=35, sigmaSpace=35)
 
 
 def letterbox(img: np.ndarray, size: int = 1024, color=(114, 114, 114)):
@@ -96,7 +100,7 @@ def adjust_yolo_labels_text(label_text: str, orig_w: int, orig_h: int, scale: fl
 
 
 def _worker(args):
-    img_path, dst_img_path, label_path, out_label_path, size = args
+    img_path, dst_img_path, label_path, out_label_path, size, denoise_method = args
     try:
         # resume support: skip if already done
         if dst_img_path.exists() and (out_label_path is None or out_label_path.exists()):
@@ -107,7 +111,7 @@ def _worker(args):
             return ("error", f"could not read {img_path}")
         orig_h, orig_w = img.shape[:2]
 
-        img = denoise(img)
+        img = denoise(img, method=denoise_method)
         img = apply_clahe(img)
         img, scale, pad_left, pad_top = letterbox(img, size=size)
 
@@ -126,21 +130,21 @@ def _worker(args):
 
 
 def process_dir(src_dir, dst_dir, labels_src=None, labels_dst=None, size=1024,
-                 workers=None, progress_every=200):
+                 workers=None, progress_every=200, denoise_method="bilateral"):
     src = Path(src_dir)
     dst = Path(dst_dir)
     files = sorted([p for p in src.iterdir() if p.suffix.lower() in IMG_EXTS])
     total = len(files)
-    print(f"[preprocess] {total} images in {src} -> {dst} (size={size})")
+    print(f"[preprocess] {total} images in {src} -> {dst} (size={size}, denoise={denoise_method})")
 
     tasks = []
     for p in files:
         dst_img_path = dst / p.name
         label_path = Path(labels_src) / (p.stem + ".txt") if labels_src else None
         out_label_path = Path(labels_dst) / (p.stem + ".txt") if labels_dst else None
-        tasks.append((p, dst_img_path, label_path, out_label_path, size))
+        tasks.append((p, dst_img_path, label_path, out_label_path, size, denoise_method))
 
-    workers = workers or max(1, os.cpu_count() - 1)
+    workers = workers or max(1, os.cpu_count())
     print(f"[preprocess] Using {workers} worker processes")
 
     done, skipped, errors = 0, 0, 0
@@ -179,6 +183,8 @@ if __name__ == "__main__":
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--workers", type=int, default=None, help="default: cpu_count - 1")
     parser.add_argument("--progress-every", type=int, default=200)
+    parser.add_argument("--denoise", choices=["bilateral", "nlm"], default="bilateral",
+                         help="bilateral (default, fast) or nlm (slower, marginally cleaner)")
     args = parser.parse_args()
 
     if args.labels_src and not args.labels_dst:
@@ -188,4 +194,5 @@ if __name__ == "__main__":
         args.src, args.dst,
         labels_src=args.labels_src, labels_dst=args.labels_dst,
         size=args.size, workers=args.workers, progress_every=args.progress_every,
+        denoise_method=args.denoise,
     )
