@@ -6,3 +6,6 @@ models/segmentation/runs/
 runs/
 *.pt
 *.joblib
+
+results/*.pt
+*.pt
