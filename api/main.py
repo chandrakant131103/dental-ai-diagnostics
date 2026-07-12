@@ -51,6 +51,23 @@ def read_image(file_bytes: bytes) -> np.ndarray:
     return img
 
 
+# Must match --crop-padding used in models/segmentation/train.py (default
+# 0.25). If you retrain the segmenter with a different value, update this
+# too - a mismatch here reintroduces the train/inference distribution shift
+# that previously caused the segmenter to output dead/all-background logits.
+SEGMENTER_CROP_PADDING = 0.25
+
+
+def _padded_crop_box(x1: int, y1: int, x2: int, y2: int, img_h: int, img_w: int) -> tuple:
+    w, h = x2 - x1, y2 - y1
+    pad_x, pad_y = w * SEGMENTER_CROP_PADDING, h * SEGMENTER_CROP_PADDING
+    px1 = max(0, int(x1 - pad_x))
+    py1 = max(0, int(y1 - pad_y))
+    px2 = min(img_w, int(x2 + pad_x))
+    py2 = min(img_h, int(y2 + pad_y))
+    return px1, py1, px2, py2
+
+
 def run_pipeline(image_bgr: np.ndarray) -> List[Finding]:
     models = PipelineModels.get()
     findings = []
@@ -62,10 +79,12 @@ def run_pipeline(image_bgr: np.ndarray) -> List[Finding]:
     names = det_results.names
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    img_h, img_w = gray.shape
 
     for box, conf, cls_id in zip(boxes, confs, class_ids):
         x1, y1, x2, y2 = [int(v) for v in box]
-        crop = gray[max(y1, 0):y2, max(x1, 0):x2]
+        px1, py1, px2, py2 = _padded_crop_box(x1, y1, x2, y2, img_h, img_w)
+        crop = gray[py1:py2, px1:px2]
         if crop.size == 0:
             continue
 

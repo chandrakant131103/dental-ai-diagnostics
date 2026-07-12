@@ -2,6 +2,13 @@
 Generates a clinician-readable PDF report: annotated X-ray + findings table
 + severity summary. This is the artifact that makes the project feel like a
 product rather than a model demo.
+
+Also supports generating a separate model-evaluation PDF (confusion matrix +
+qualitative failure examples) via generate_eval_report(), so failure modes
+are documented alongside the per-patient report rather than only claimed
+to work. For a healthcare-adjacent project, showing exactly where the
+model misses is more credible to a reviewer than a report that only ever
+shows clean predictions.
 """
 import io
 from datetime import datetime
@@ -82,6 +89,115 @@ def generate_pdf_report(image_bgr: np.ndarray, findings, patient_name: str = "N/
         "to support, not replace, evaluation by a licensed dental professional.",
         styles["Italic"],
     ))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _confusion_matrix_image(confusion: np.ndarray, class_names: list, out_size_px: int = 900) -> io.BytesIO:
+    """Renders a confusion matrix (numpy array, from evaluation/metrics.py's
+    evaluate_detections()['confusion_matrix']) as a PNG in memory, using
+    matplotlib so we don't need an extra runtime dependency beyond what
+    evaluation already needs.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = class_names + ["background"]
+    fig, ax = plt.subplots(figsize=(max(6, len(labels) * 0.5), max(6, len(labels) * 0.5)))
+    im = ax.imshow(confusion, cmap="Blues")
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Ground truth")
+    ax.set_title("Detection confusion matrix (IoU-matched)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def generate_eval_report(confusion: np.ndarray, class_names: list, per_class_rows: list,
+                          failure_examples: list) -> bytes:
+    """Builds a model-evaluation PDF: confusion matrix + per-class metrics
+    table + a handful of real qualitative failure examples (missed or
+    over-predicted findings on actual X-rays), rather than only ever
+    showing clean successful predictions.
+
+    Args:
+        confusion: square numpy array from evaluate_detections()['confusion_matrix'].
+        class_names: list of class names in the same order used to build confusion.
+        per_class_rows: list of dicts like evaluate_detections()['per_class'] rows
+            (class, tp, fp, fn, precision, recall, f1).
+        failure_examples: list of dicts, each with:
+            {"image_bgr": np.ndarray, "caption": str}
+            e.g. an X-ray with the ground-truth box in green and the
+            missed/incorrect prediction in red, and a caption explaining
+            what went wrong ("Caries missed - low contrast lesion, conf 0.19").
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm)
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("Dental AI - Model Evaluation Report", styles["Title"]))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 6 * mm))
+
+    story.append(Paragraph(
+        "This report documents model performance including known failure modes. "
+        "It is intended for engineering/reviewer use, not as a patient-facing document.",
+        styles["Italic"],
+    ))
+    story.append(Spacer(1, 6 * mm))
+
+    story.append(Paragraph("Per-class detection performance", styles["Heading2"]))
+    table_data = [["Class", "TP", "FP", "FN", "Precision", "Recall", "F1"]]
+    for row in per_class_rows:
+        table_data.append([
+            row["class"], str(row["tp"]), str(row["fp"]), str(row["fn"]),
+            f"{float(row['precision']):.3f}", f"{float(row['recall']):.3f}", f"{float(row['f1']):.3f}",
+        ])
+    table = Table(table_data, colWidths=[35 * mm, 16 * mm, 16 * mm, 16 * mm, 22 * mm, 20 * mm, 18 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1565c0")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(Paragraph("Confusion matrix", styles["Heading2"]))
+    cm_img = _confusion_matrix_image(confusion, class_names)
+    story.append(RLImage(cm_img, width=150 * mm, height=150 * mm))
+    story.append(Spacer(1, 8 * mm))
+
+    if failure_examples:
+        story.append(Paragraph("Qualitative failure examples", styles["Heading2"]))
+        story.append(Paragraph(
+            "Real examples where the model missed or mis-predicted a finding, "
+            "included so reviewers can see failure modes directly rather than "
+            "only aggregate numbers.",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 4 * mm))
+        for ex in failure_examples:
+            img_bgr = ex["image_bgr"]
+            ok, buf_img = cv2.imencode(".png", img_bgr)
+            img_stream = io.BytesIO(buf_img.tobytes())
+            story.append(RLImage(img_stream, width=140 * mm,
+                                  height=140 * mm * img_bgr.shape[0] / img_bgr.shape[1]))
+            story.append(Paragraph(ex.get("caption", ""), styles["Normal"]))
+            story.append(Spacer(1, 6 * mm))
 
     doc.build(story)
     return buf.getvalue()

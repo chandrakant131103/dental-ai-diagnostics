@@ -92,11 +92,33 @@ for first, so keep it current:_
 
 | Metric | Value |
 |---|---|
-| Detector mAP@50 | TBD |
-| Detector mAP@50-95 | TBD |
+| Detector mAP@50 | 0.410 |
+| Detector mAP@50-95 | 0.214 |
+| Detector macro precision / recall (fixed-IoU eval, thresh=0.5) | 0.432 / 0.428 |
+| Caries precision / recall | 0.6562 / 0.1583 |
 | Segmentation mean Dice | TBD |
-| Macro precision / recall (detector) | TBD |
-| Inference latency (CPU / GPU) | TBD |
+| Inference latency (CPU) | TBD |
+| Inference latency (GPU) | TBD |
+| Detector epochs completed | 22 |
+
+**Per-class detection performance** (fixed IoU-matched eval):
+
+| Class | Precision | Recall | F1 |
+|---|---|---|---|
+| Caries | 0.6562 | 0.1583 | 0.2551 |
+| Crown | 0.646 | 0.8911 | 0.749 |
+| Filling | 0.5071 | 0.4352 | 0.4684 |
+| Implant | 0.7656 | 0.8989 | 0.8269 |
+| Malaligned | 0.0 | 0.0 | 0.0 |
+| Mandibular Canal | 0.2524 | 0.65 | 0.3636 |
+| Missing teeth | 0.6791 | 0.5385 | 0.6007 |
+| Periapical lesion | 0.5093 | 0.0977 | 0.1639 |
+| Retained root | 0.0 | 0.0 | 0.0 |
+| Root Canal Treatment | 0.4912 | 0.5773 | 0.5308 |
+| Root Piece | 0.4868 | 0.5993 | 0.5372 |
+| croen | 0.0 | 0.0 | 0.0 |
+| impacted tooth | 0.8343 | 0.9373 | 0.8828 |
+| maxillary sinus | 0.2273 | 0.2083 | 0.2174 |
 
 ## Known dataset caveats worth mentioning in interviews
 - 18 detection classes are heavily imbalanced (e.g. "Caries" vastly
@@ -107,6 +129,36 @@ for first, so keep it current:_
 - Left/right flip augmentation is intentionally disabled by default since
   tooth siding (FDI numbering) is clinically meaningful; flipping without
   remapping labels would silently corrupt them.
+
+## Current status / known gaps (updated after first full training run)
+- **Caries recall is currently 0.16** (misses ~84% of actual caries) despite
+  reasonable precision (0.66). This is the metric that matters most for a
+  cavity-detection product and is not yet production-usable. Mitigation in
+  progress: `data/oversample_rare_classes.py` oversamples caries-containing
+  training images (ultralytics YOLOv8's public API doesn't expose per-class
+  loss weighting, so sampling frequency is the practical lever). Re-train
+  and re-run `evaluation/generate_report.py` after applying it.
+- **The U-Net segmentation stage previously collapsed to all-background**
+  (dead/negative logits, 0% positive Grad-CAM activation). Root cause: the
+  training dataloader resized whole panoramic X-rays to 256x256 while
+  inference crops individual findings first — the model was trained on a
+  different input distribution than it was asked to predict on. Fixed in
+  `models/segmentation/dataset.py` (per-finding crops matching inference)
+  and `models/segmentation/train.py` (class-weighted loss + a mandatory
+  pre-training sanity check that aborts if masks are empty). Re-train with
+  the fixed dataset and run `models/segmentation/evaluate.py` to get a real
+  Dice score before trusting segmentation output.
+- Detector mAP@50 (0.41) and mAP@50-95 (0.214) are from a run that stopped
+  at epoch 22/30 (early stopping or interruption) - a longer/tuned run
+  would likely improve these.
+- Latency has not yet been benchmarked; run `evaluation/benchmark_latency.py`
+  on your target deployment hardware and re-run `generate_report.py` to
+  fill that row in with a real, hardware-specific number.
+- The "mAP@50-95" from the custom `evaluation/metrics.py::compute_map()` is
+  a simplified proxy (mean of macro-precision across IoU thresholds), not a
+  full COCO-style precision/recall-curve integration — the mAP figures in
+  the table above are ultralytics' own validation metrics instead, which
+  are the standard implementation.
 
 ## Disclaimer
 This is a research/portfolio project, not a certified medical device. The

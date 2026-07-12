@@ -1,0 +1,8 @@
+
+__pycache__/
+*.pyc
+kaggle.json
+models/segmentation/runs/
+runs/
+*.pt
+*.joblib
